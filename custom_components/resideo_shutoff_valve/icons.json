@@ -1,0 +1,18 @@
+{
+  "entity": {
+    "sensor": {
+      "leak_status": {
+        "default": "mdi:water-alert"
+      },
+      "motor_cycles": {
+        "default": "mdi:counter"
+      },
+      "last_checkin": {
+        "default": "mdi:clock-check-outline"
+      },
+      "last_antiscale": {
+        "default": "mdi:water-sync"
+      }
+    }
+  }
+}
