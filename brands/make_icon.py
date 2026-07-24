@@ -4,6 +4,7 @@ Draws a neutral water shut-off valve handwheel (universal shut-off symbol) on a
 rounded water-blue tile. Not an imitation of any official Resideo/Honeywell mark.
 """
 import math
+
 from PIL import Image, ImageDraw
 
 SS = 4  # supersample factor for anti-aliasing
@@ -63,8 +64,11 @@ def draw_icon(size):
     # ---- stem ----
     stem_w = 0.055 * S
     wheel_cy = 0.335 * S
-    d.rounded_rectangle([cx - stem_w / 2, wheel_cy, cx + stem_w / 2, body_top_y + 0.01 * S],
-                        radius=stem_w / 2, fill=W)
+    d.rounded_rectangle(
+        [cx - stem_w / 2, wheel_cy, cx + stem_w / 2, body_top_y + 0.01 * S],
+        radius=stem_w / 2,
+        fill=W,
+    )
 
     # ---- handwheel ----
     R = 0.205 * S           # outer radius
