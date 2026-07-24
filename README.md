@@ -27,7 +27,9 @@ For each L5 valve on your account this integration creates:
 | Last anti-scale cycle | `sensor` (timestamp, diagnostic, disabled by default) | Last automatic anti-scale exercise |
 
 > **Note:** This is a cloud-polling integration. State refreshes every 5 minutes; after you send an
-> open/close command the state is refreshed immediately.
+> open/close command the state is refreshed immediately. Valves are discovered when the integration
+> is set up (or reloaded) — each subsequent refresh then queries only your valve(s). If you add a new
+> L5 valve to your Resideo account, reload the integration to pick it up.
 
 ## Prerequisites
 

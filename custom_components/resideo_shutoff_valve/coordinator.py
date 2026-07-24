@@ -125,24 +125,53 @@ class ResideoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, ResideoValveD
             update_interval=UPDATE_INTERVAL,
         )
         self.client = client
+        # Cached ``(location_id, device_id)`` pairs for every shutoff valve on
+        # the account. Populated on the first refresh (see ``_async_update_data``)
+        # and reused thereafter so steady-state polling never re-downloads the
+        # whole account device tree. ``None`` means discovery has not run yet.
+        self._valves: list[tuple[str, str]] | None = None
 
     async def _async_update_data(self) -> dict[str, ResideoValveData]:
-        """Fetch the latest state of every shutoff valve."""
-        valves: dict[str, ResideoValveData] = {}
+        """Fetch the latest state of every shutoff valve.
+
+        Discovery — *which* valves exist and the location each belongs to — is a
+        one-time step. The ``/locations`` endpoint returns the entire account
+        device tree (every thermostat, security panel and camera), so it is
+        queried only once: on the first refresh, or after a reload. The
+        resulting ids are cached, and subsequent polls fetch each valve directly
+        by id, keeping every refresh to a single small request per valve.
+        """
         try:
-            locations = await self.client.async_get_locations()
-            for location in locations:
-                location_id = str(location.get("locationID"))
-                for device in location.get("devices", []):
-                    if device.get("deviceClass") != DEVICE_CLASS_SHUTOFF_VALVE:
-                        continue
-                    device_id = device["deviceID"]
-                    detail = await self.client.async_get_valve(location_id, device_id)
-                    valves[device_id] = ResideoValveData(location_id, detail)
+            if self._valves is None:
+                self._valves = await self._async_discover_valves()
+
+            valves: dict[str, ResideoValveData] = {}
+            for location_id, device_id in self._valves:
+                detail = await self.client.async_get_valve(location_id, device_id)
+                valves[device_id] = ResideoValveData(location_id, detail)
         except ResideoAuthError as err:
             raise ConfigEntryAuthFailed(str(err)) from err
         except ResideoConnectionError as err:
             raise UpdateFailed(str(err)) from err
 
-        LOGGER.debug("Found %d shutoff valve(s)", len(valves))
+        LOGGER.debug("Updated %d shutoff valve(s)", len(valves))
         return valves
+
+    async def _async_discover_valves(self) -> list[tuple[str, str]]:
+        """Discover every shutoff valve and return its location/device ids.
+
+        Adding a valve to the account requires reloading the integration to
+        create its entities, so re-running discovery on every poll served no
+        purpose; it is deliberately done just once and cached.
+        """
+        discovered: list[tuple[str, str]] = []
+        locations = await self.client.async_get_locations()
+        for location in locations:
+            location_id = str(location.get("locationID"))
+            for device in location.get("devices", []):
+                if device.get("deviceClass") != DEVICE_CLASS_SHUTOFF_VALVE:
+                    continue
+                discovered.append((location_id, device["deviceID"]))
+
+        LOGGER.debug("Discovered %d shutoff valve(s)", len(discovered))
+        return discovered
