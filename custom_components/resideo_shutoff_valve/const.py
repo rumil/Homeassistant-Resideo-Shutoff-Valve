@@ -31,16 +31,18 @@ STATE_OPENING: Final = "opening"
 STATE_CLOSING: Final = "closing"
 
 # Maps the Resideo ``valveStatus`` field to a normalised HA valve state.
-# ``None`` means the state is unknown / indeterminate.
+# ``None`` means the state is unknown / indeterminate. Keys are lower case;
+# ``ResideoValveData.valve_status`` lower-cases the raw value before lookup.
 VALVE_STATUS_MAP: Final[dict[str, str | None]] = {
     "open": STATE_OPEN,
     "close": STATE_CLOSED,
-    "notOpen": STATE_CLOSED,
+    "closed": STATE_CLOSED,
+    "notopen": STATE_CLOSED,
     "opening": STATE_OPENING,
-    "antiScaleOpening": STATE_OPENING,
+    "antiscaleopening": STATE_OPENING,
     "closing": STATE_CLOSING,
-    "antiScaleClosing": STATE_CLOSING,
-    "notClose": None,
+    "antiscaleclosing": STATE_CLOSING,
+    "notclose": None,
     "unknown": None,
     "err": None,
 }

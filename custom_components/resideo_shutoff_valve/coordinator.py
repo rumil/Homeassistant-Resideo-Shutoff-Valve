@@ -57,13 +57,20 @@ class ResideoValveData:
 
     @property
     def valve_status(self) -> str | None:
-        """Return the raw ``valveStatus`` value."""
-        return self._actuator.get("valveStatus")
+        """Return the ``valveStatus`` value, normalised to lower case.
+
+        The cloud reports these values capitalised (e.g. ``"Open"``), so they
+        are lower-cased here to give the rest of the integration a single,
+        predictable casing to match against.
+        """
+        status = self._actuator.get("valveStatus")
+        return status.lower() if status is not None else None
 
     @property
     def leak_status(self) -> str | None:
-        """Return the raw ``leakStatus`` value."""
-        return self._actuator.get("leakStatus")
+        """Return the ``leakStatus`` value, normalised to lower case."""
+        status = self._actuator.get("leakStatus")
+        return status.lower() if status is not None else None
 
     @property
     def device_temperature(self) -> float | None:
