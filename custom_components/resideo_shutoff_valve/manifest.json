@@ -1,13 +1,13 @@
 {
   "domain": "resideo_shutoff_valve",
   "name": "Resideo Shutoff Valve",
-  "codeowners": ["@mkupisz"],
+  "codeowners": ["@rumil"],
   "config_flow": true,
   "dependencies": ["application_credentials"],
-  "documentation": "https://github.com/mkupisz/Homeassistant-Honeywell-Lyric-Shutoff-Valve",
+  "documentation": "https://github.com/rumil/Homeassistant-Resideo-Shutoff-Valve",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/mkupisz/Homeassistant-Honeywell-Lyric-Shutoff-Valve/issues",
+  "issue_tracker": "https://github.com/rumil/Homeassistant-Resideo-Shutoff-Valve/issues",
   "loggers": ["custom_components.resideo_shutoff_valve"],
   "requirements": [],
   "version": "0.1.0"
