@@ -125,12 +125,8 @@ class ResideoClient:
             await self._oauth_session.force_refresh_token()
         except ClientResponseError as err:
             if err.status in (401, 403):
-                raise ResideoAuthError(
-                    f"Token refresh rejected: {err.status}"
-                ) from err
-            raise ResideoConnectionError(
-                f"Token refresh failed: {err.status}"
-            ) from err
+                raise ResideoAuthError(f"Token refresh rejected: {err.status}") from err
+            raise ResideoConnectionError(f"Token refresh failed: {err.status}") from err
         except (ClientError, TimeoutError) as err:
             raise ResideoConnectionError(f"Token refresh failed: {err}") from err
 
