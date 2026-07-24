@@ -49,7 +49,11 @@ SENSORS: tuple[ResideoSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.ENUM,
         options=LEAK_STATUS_OPTIONS,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda valve: valve.leak_status,
+        # Fall back to ``None`` for any value the cloud reports that is not a
+        # known option, so an unexpected status never crashes entity setup.
+        value_fn=lambda valve: (
+            valve.leak_status if valve.leak_status in LEAK_STATUS_OPTIONS else None
+        ),
     ),
     ResideoSensorEntityDescription(
         key="motor_cycles",
