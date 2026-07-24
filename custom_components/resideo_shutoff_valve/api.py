@@ -28,6 +28,29 @@ class ResideoConnectionError(Exception):
     """Raised when the Resideo cloud cannot be reached."""
 
 
+class ResideoOAuth2Session(config_entry_oauth2_flow.OAuth2Session):
+    """OAuth2 session that can force an unconditional token refresh.
+
+    Honeywell's cloud is known to reject access tokens *before* their nominal
+    expiry: the token Home Assistant has stored stops working even though its
+    ``expires_at`` is still in the future. ``async_ensure_token_valid`` only
+    refreshes once ``expires_at`` has passed, so a prematurely-invalidated token
+    is never renewed and every request 401s until the user re-authenticates.
+
+    ``force_refresh_token`` exchanges the refresh token for a fresh access token
+    regardless of ``expires_at`` and persists it, mirroring the official
+    ``lyric`` integration's ``OAuth2SessionLyric``.
+    """
+
+    async def force_refresh_token(self) -> None:
+        """Force a token refresh and persist the new token to the config entry."""
+        new_token = await self.implementation.async_refresh_token(self.token)
+        self.hass.config_entries.async_update_entry(
+            self.config_entry,
+            data={**self.config_entry.data, "token": new_token},
+        )
+
+
 class ResideoLocalOAuth2Implementation(AuthImplementation):
     """Local OAuth2 implementation for the Resideo / Honeywell Home cloud.
 
@@ -62,7 +85,7 @@ class ResideoClient:
     def __init__(
         self,
         websession: ClientSession,
-        oauth_session: config_entry_oauth2_flow.OAuth2Session,
+        oauth_session: ResideoOAuth2Session,
     ) -> None:
         """Initialise the client."""
         self._websession = websession
@@ -74,15 +97,52 @@ class ResideoClient:
         return self._oauth_session.implementation.client_id  # type: ignore[attr-defined]
 
     async def _async_request(self, method: str, path: str, **kwargs: Any) -> Any:
-        """Perform an authenticated request against the API."""
+        """Perform an authenticated request, refreshing the token once on 401.
+
+        Honeywell is known to reject a stored access token before its nominal
+        expiry, so ``async_ensure_token_valid`` (which only refreshes on expiry)
+        is not enough on its own. When a request comes back ``401``/``403``, the
+        token is force-refreshed via the refresh token and the request is retried
+        exactly once before the failure is surfaced as a ``ResideoAuthError``.
+        This mirrors the recovery the official ``lyric`` integration performs.
+        """
         await self._oauth_session.async_ensure_token_valid()
+        try:
+            return await self._async_send(method, path, **kwargs)
+        except ResideoAuthError:
+            LOGGER.debug(
+                "Authentication failed for %s %s; forcing token refresh and "
+                "retrying once",
+                method,
+                path,
+            )
+            await self._async_force_refresh_token()
+            return await self._async_send(method, path, **kwargs)
+
+    async def _async_force_refresh_token(self) -> None:
+        """Force a token refresh, normalising transport errors."""
+        try:
+            await self._oauth_session.force_refresh_token()
+        except ClientResponseError as err:
+            if err.status in (401, 403):
+                raise ResideoAuthError(
+                    f"Token refresh rejected: {err.status}"
+                ) from err
+            raise ResideoConnectionError(
+                f"Token refresh failed: {err.status}"
+            ) from err
+        except (ClientError, TimeoutError) as err:
+            raise ResideoConnectionError(f"Token refresh failed: {err}") from err
+
+    async def _async_send(self, method: str, path: str, **kwargs: Any) -> Any:
+        """Send a single authenticated request against the API."""
         access_token = self._oauth_session.token["access_token"]
 
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
         }
-        params: dict[str, Any] = kwargs.pop("params", {})
+        params: dict[str, Any] = dict(kwargs.pop("params", {}))
         params["apikey"] = self._apikey
 
         try:

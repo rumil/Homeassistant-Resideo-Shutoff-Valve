@@ -7,7 +7,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .api import ResideoClient
+from .api import ResideoClient, ResideoOAuth2Session
 from .coordinator import ResideoConfigEntry, ResideoDataUpdateCoordinator
 
 PLATFORMS: list[Platform] = [
@@ -24,7 +24,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ResideoConfigEntry) -> b
             hass, entry
         )
     )
-    oauth_session = config_entry_oauth2_flow.OAuth2Session(hass, entry, implementation)
+    oauth_session = ResideoOAuth2Session(hass, entry, implementation)
     client = ResideoClient(async_get_clientsession(hass), oauth_session)
 
     coordinator = ResideoDataUpdateCoordinator(hass, entry, client)
