@@ -19,6 +19,14 @@ type ResideoConfigEntry = ConfigEntry[ResideoDataUpdateCoordinator]
 
 UPDATE_INTERVAL = timedelta(seconds=300)
 
+# How long transient refresh failures may persist before we give up on
+# recovering silently and escalate to a reauth flow. A genuinely dead grant is
+# escalated immediately (see ``ResideoAuthError``); this bound ensures a token
+# endpoint that keeps returning non-dead-grant errors (e.g. a persistent 400
+# without ``invalid_grant``, or a long cloud outage) still surfaces to the user
+# instead of leaving the valves unmonitored indefinitely.
+AUTH_ESCALATION_AFTER = timedelta(minutes=15)
+
 
 @dataclass
 class ResideoValveData:
@@ -130,6 +138,10 @@ class ResideoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, ResideoValveD
         # and reused thereafter so steady-state polling never re-downloads the
         # whole account device tree. ``None`` means discovery has not run yet.
         self._valves: list[tuple[str, str]] | None = None
+        # When the current run of transient refresh failures began, or ``None``
+        # while the last refresh succeeded. Used to escalate a persistent
+        # transient failure to reauth (see ``AUTH_ESCALATION_AFTER``).
+        self._transient_failure_since: datetime | None = None
 
     async def _async_update_data(self) -> dict[str, ResideoValveData]:
         """Fetch the latest state of every shutoff valve.
@@ -150,12 +162,40 @@ class ResideoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, ResideoValveD
                 detail = await self.client.async_get_valve(location_id, device_id)
                 valves[device_id] = ResideoValveData(location_id, detail)
         except ResideoAuthError as err:
+            # The grant is dead: escalate to reauth immediately. Raising the
+            # plain ``ConfigEntryAuthFailed`` (not core's
+            # ``OAuth2TokenRequestReauthError``) is deliberate — the coordinator
+            # notifies entity listeners for it, so every entity becomes
+            # unavailable on this same refresh.
+            self._transient_failure_since = None
             raise ConfigEntryAuthFailed(str(err)) from err
         except ResideoConnectionError as err:
-            raise UpdateFailed(str(err)) from err
+            raise self._transient_or_escalate(err) from err
 
         LOGGER.debug("Updated %d shutoff valve(s)", len(valves))
+        self._transient_failure_since = None
         return valves
+
+    def _transient_or_escalate(
+        self, err: ResideoConnectionError
+    ) -> UpdateFailed | ConfigEntryAuthFailed:
+        """Return ``UpdateFailed`` for a transient error, escalating if stuck.
+
+        A transient failure keeps polling (entities unavailable, recovering on
+        their own). But if transient failures have persisted for longer than
+        ``AUTH_ESCALATION_AFTER`` the integration stops retrying silently and
+        escalates to a reauth flow, so a stuck token endpoint still reaches the
+        user instead of leaving the valves unmonitored forever.
+        """
+        now = dt_util.utcnow()
+        if self._transient_failure_since is None:
+            self._transient_failure_since = now
+        elif now - self._transient_failure_since >= AUTH_ESCALATION_AFTER:
+            self._transient_failure_since = None
+            return ConfigEntryAuthFailed(
+                f"Token refresh still failing after {AUTH_ESCALATION_AFTER}: {err}"
+            )
+        return UpdateFailed(str(err))
 
     async def _async_discover_valves(self) -> list[tuple[str, str]]:
         """Discover every shutoff valve and return its location/device ids.

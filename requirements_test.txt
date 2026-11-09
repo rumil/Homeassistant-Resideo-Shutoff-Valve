@@ -1,0 +1,4 @@
+# Test dependencies. pytest-homeassistant-custom-component pins an exact
+# Home Assistant Core version; 0.13.375 pins 2026.10.4, the version this
+# integration is developed and tested against.
+pytest-homeassistant-custom-component==0.13.375

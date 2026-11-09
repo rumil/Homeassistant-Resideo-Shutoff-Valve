@@ -10,45 +10,107 @@ token endpoint.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
-from aiohttp import BasicAuth, ClientError, ClientResponseError, ClientSession
+from aiohttp import (
+    ClientError,
+    ClientResponse,
+    ClientResponseError,
+    ClientSession,
+    encode_basic_auth,
+)
 from homeassistant.components.application_credentials import AuthImplementation
 from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import API_BASE, LOGGER, REQUEST_TIMEOUT
 
+# OAuth ``error`` codes (RFC 6749 §5.2) that mean the grant is dead: the stored
+# refresh token will never work again, so the only recovery is reauthentication.
+# Any other token-endpoint failure (other 4xx, 5xx, network) is treated as
+# transient and retried; see ``ResideoTokenError.is_permanent``.
+DEAD_GRANT_ERROR_CODES = frozenset({"invalid_grant", "invalid_client"})
+
 
 class ResideoAuthError(Exception):
-    """Raised when authentication with the Resideo cloud fails."""
+    """Raised when authentication has permanently failed (grant is dead).
+
+    The coordinator maps this to ``ConfigEntryAuthFailed`` so Home Assistant
+    marks every entity unavailable and immediately starts a reauth flow.
+    """
 
 
 class ResideoConnectionError(Exception):
-    """Raised when the Resideo cloud cannot be reached."""
+    """Raised for a transient failure (network, 5xx, recoverable token error).
+
+    The coordinator maps this to ``UpdateFailed`` so entities go unavailable but
+    polling continues and recovers on its own once the cloud responds again.
+    """
+
+
+class ResideoTokenError(Exception):
+    """A token-endpoint refresh failure, carrying the parsed OAuth error code.
+
+    Raised from :meth:`ResideoLocalOAuth2Implementation._token_request` for the
+    ``refresh_token`` grant. Because it is a plain ``Exception`` (not a
+    ``ClientError`` or one of core's ``OAuth2TokenRequest*`` types), it passes
+    straight through core's token-refresh machinery instead of being remapped to
+    ``OAuth2TokenRequestReauthError`` — which would otherwise start a reauth flow
+    for *every* 4xx and bypass this integration's own transient/permanent
+    classification.
+    """
+
+    def __init__(self, *, status: int, error_code: str | None) -> None:
+        """Store the HTTP status and the OAuth ``error`` code from the body."""
+        self.status = status
+        self.error_code = error_code
+        detail = f"{status} {error_code}" if error_code else str(status)
+        super().__init__(f"Token refresh failed: {detail}")
+
+    @property
+    def is_permanent(self) -> bool:
+        """Return True when the grant is dead and reauth is the only recovery."""
+        return self.status == 401 or self.error_code in DEAD_GRANT_ERROR_CODES
+
+    def as_api_error(self) -> ResideoAuthError | ResideoConnectionError:
+        """Return the client-level error matching this failure's severity."""
+        if self.is_permanent:
+            return ResideoAuthError(str(self))
+        return ResideoConnectionError(str(self))
 
 
 class ResideoOAuth2Session(config_entry_oauth2_flow.OAuth2Session):
-    """OAuth2 session that can force an unconditional token refresh.
+    """OAuth2 session whose forced refresh shares the core token lock.
 
     Honeywell's cloud is known to reject access tokens *before* their nominal
-    expiry: the token Home Assistant has stored stops working even though its
-    ``expires_at`` is still in the future. ``async_ensure_token_valid`` only
-    refreshes once ``expires_at`` has passed, so a prematurely-invalidated token
-    is never renewed and every request 401s until the user re-authenticates.
-
-    ``force_refresh_token`` exchanges the refresh token for a fresh access token
-    regardless of ``expires_at`` and persists it, mirroring the official
-    ``lyric`` integration's ``OAuth2SessionLyric``.
+    expiry: the stored token stops working even though ``expires_at`` is still in
+    the future, and ``async_ensure_token_valid`` only refreshes once it has
+    passed. :meth:`async_refresh_token_if_unchanged` forces a refresh in that
+    case, but it does so under the session's own ``_token_lock`` — the same lock
+    ``async_ensure_token_valid`` holds — so a forced refresh can never run
+    concurrently with an expiry refresh or another forced refresh. Honeywell is
+    believed to rotate refresh tokens, so two concurrent refreshes would send the
+    same (soon-invalidated) refresh token and kill the grant.
     """
 
-    async def force_refresh_token(self) -> None:
-        """Force a token refresh and persist the new token to the config entry."""
-        new_token = await self.implementation.async_refresh_token(self.token)
-        self.hass.config_entries.async_update_entry(
-            self.config_entry,
-            data={**self.config_entry.data, "token": new_token},
-        )
+    async def async_refresh_token_if_unchanged(self, access_token_before: str) -> None:
+        """Refresh the token once, unless another caller already refreshed it.
+
+        ``access_token_before`` is the access token the caller used for the
+        request that just failed. Under the lock, if the stored access token no
+        longer matches it, another caller has already refreshed and the caller
+        should simply retry with the current token — so this returns without
+        making a second (racing) token request.
+        """
+        async with self._token_lock:
+            if self.token.get("access_token") != access_token_before:
+                return
+            new_token = await self.implementation.async_refresh_token(self.token)
+            self.hass.config_entries.async_update_entry(
+                self.config_entry,
+                data={**self.config_entry.data, "token": new_token},
+            )
 
 
 class ResideoLocalOAuth2Implementation(AuthImplementation):
@@ -66,17 +128,59 @@ class ResideoLocalOAuth2Implementation(AuthImplementation):
         return {"response_type": "code", "appSelect": "1"}
 
     async def _token_request(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Make a token request authenticated with HTTP Basic auth."""
+        """Make a token request authenticated with HTTP Basic auth.
+
+        On an error response the body's ``error`` / ``error_description`` are
+        logged at WARNING (never the request body, which holds the client secret
+        and refresh token, nor any auth header). For the ``refresh_token`` grant
+        the failure is raised as :class:`ResideoTokenError` carrying the parsed
+        code so callers can tell a dead grant from a transient blip; the
+        authorization-code grant (initial setup / reauth) keeps core's default
+        handling so the config flow still reports errors the usual way.
+        """
         session = async_get_clientsession(self.hass)
         data["client_id"] = self.client_id
 
         resp = await session.post(
             self.token_url,
             data=data,
-            auth=BasicAuth(self.client_id, self.client_secret),
+            headers={
+                "Authorization": encode_basic_auth(self.client_id, self.client_secret),
+            },
         )
-        resp.raise_for_status()
+        if resp.status >= 400:
+            error_code, error_description = await self._parse_token_error(resp)
+            LOGGER.warning(
+                "Resideo token request (%s) failed with HTTP %s: %s%s",
+                data.get("grant_type", "unknown"),
+                resp.status,
+                error_code or "no error code",
+                f" ({error_description})" if error_description else "",
+            )
+            if data.get("grant_type") == "refresh_token":
+                raise ResideoTokenError(status=resp.status, error_code=error_code)
+            resp.raise_for_status()
         return await resp.json()
+
+    @staticmethod
+    async def _parse_token_error(resp: ClientResponse) -> tuple[str | None, str | None]:
+        """Extract ``error`` / ``error_description`` from a token error body."""
+        try:
+            body = await resp.text()
+        except (ClientError, TimeoutError):
+            return None, None
+        try:
+            parsed = json.loads(body)
+        except (ValueError, TypeError):
+            return None, None
+        if not isinstance(parsed, dict):
+            return None, None
+        error = parsed.get("error")
+        description = parsed.get("error_description")
+        return (
+            error if isinstance(error, str) else None,
+            description if isinstance(description, str) else None,
+        )
 
 
 class ResideoClient:
@@ -99,34 +203,53 @@ class ResideoClient:
     async def _async_request(self, method: str, path: str, **kwargs: Any) -> Any:
         """Perform an authenticated request, refreshing the token once on 401.
 
-        Honeywell is known to reject a stored access token before its nominal
-        expiry, so ``async_ensure_token_valid`` (which only refreshes on expiry)
-        is not enough on its own. When a request comes back ``401``/``403``, the
-        token is force-refreshed via the refresh token and the request is retried
-        exactly once before the failure is surfaced as a ``ResideoAuthError``.
-        This mirrors the recovery the official ``lyric`` integration performs.
+        ``async_ensure_token_valid`` is awaited *inside* this method's error
+        mapping so a failure at the token endpoint surfaces as a
+        ``ResideoAuthError`` / ``ResideoConnectionError`` — never as a raw core
+        ``OAuth2TokenRequestReauthError``. That matters because the coordinator
+        only ever sees our two error types, and core's ``DataUpdateCoordinator``
+        notifies entity listeners for both (so entities go unavailable) whereas
+        it silently returns on a leaked ``OAuth2TokenRequestReauthError``,
+        leaving entities frozen on stale data.
+
+        Honeywell is also known to reject a stored access token before its
+        nominal expiry, so when a request comes back ``401``/``403`` the token is
+        force-refreshed (unless another caller already refreshed it) and the
+        request is retried exactly once before the failure is surfaced.
         """
-        await self._oauth_session.async_ensure_token_valid()
+        await self._async_ensure_token_valid()
+
+        access_token_before = self._oauth_session.token.get("access_token")
         try:
             return await self._async_send(method, path, **kwargs)
         except ResideoAuthError:
             LOGGER.debug(
-                "Authentication failed for %s %s; forcing token refresh and "
-                "retrying once",
+                "Access token rejected for %s %s; refreshing once and retrying",
                 method,
                 path,
             )
-            await self._async_force_refresh_token()
+            await self._async_refresh_after_rejection(access_token_before)
             return await self._async_send(method, path, **kwargs)
 
-    async def _async_force_refresh_token(self) -> None:
-        """Force a token refresh, normalising transport errors."""
+    async def _async_ensure_token_valid(self) -> None:
+        """Ensure the token is valid, normalising every failure to our errors."""
         try:
-            await self._oauth_session.force_refresh_token()
-        except ClientResponseError as err:
-            if err.status in (401, 403):
-                raise ResideoAuthError(f"Token refresh rejected: {err.status}") from err
-            raise ResideoConnectionError(f"Token refresh failed: {err.status}") from err
+            await self._oauth_session.async_ensure_token_valid()
+        except ResideoTokenError as err:
+            raise err.as_api_error() from err
+        except (ClientError, TimeoutError) as err:
+            raise ResideoConnectionError(f"Token request failed: {err}") from err
+
+    async def _async_refresh_after_rejection(
+        self, access_token_before: str | None
+    ) -> None:
+        """Force a single-flight refresh, normalising every failure to our errors."""
+        try:
+            await self._oauth_session.async_refresh_token_if_unchanged(
+                access_token_before or ""
+            )
+        except ResideoTokenError as err:
+            raise err.as_api_error() from err
         except (ClientError, TimeoutError) as err:
             raise ResideoConnectionError(f"Token refresh failed: {err}") from err
 
